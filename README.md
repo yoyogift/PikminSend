@@ -2,6 +2,10 @@
 
 一款結合桌寵互動與 [LocalSend v2](https://github.com/localsend/protocol) 協議的 macOS 輕量級區域網路 / Tailscale 傳檔工具。
 
+| 待機召喚（雙擊 `Shift`） | 裝入檔案合力搬運 | 接收端左下角探頭確認 |
+| :---: | :---: | :---: |
+| ![待機動畫](docs/demo_idle.gif) | ![搬運動畫](docs/demo_carry.gif) | ![探頭接收](docs/demo_peek.gif) |
+
 ## 功能特色
 
 - **選單列常駐 & 雙擊 `Shift` 喚醒**：平時隱身於 macOS 頂部選單列（不佔 Dock），連按兩下 `Shift` 即可在螢幕左下角召喚桌寵（會自動過濾打字大寫誤觸）。
@@ -27,4 +31,5 @@ open build/PikminSend.app
 
 - `Sources/PikminSend/`：Swift 應用程式原始碼（選單列、熱鍵監聽、LocalSend 伺服器/客戶端、Tailscale 發現、桌寵視窗）
 - `Resources/`：打包完成的透明 APNG 動畫素材（`pikmin_idle.png`、`pikmin_carry.png`、`pikmin_peek_idle.png`、`pikmin_peek_wave.png`）
-- `scripts/`：Blender 自動算圖腳本（`blender_pikmin_setup.py`）、APNG 打包腳本（`pngs_to_apng.swift`）與 `.app` 打包腳本（`build_app.sh`）
+- `docs/`：README 展示用 GIF 動圖
+- `scripts/`：Blender 自動算圖腳本（`blender_pikmin_setup.py`）、APNG / GIF 打包腳本與 `.app` 打包腳本（`build_app.sh`）
