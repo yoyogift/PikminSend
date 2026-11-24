@@ -1,0 +1,12 @@
+.DS_Store
+.build/
+build/
+
+# 中繼算圖序列圖與大型原始模型（最終動畫已打包於 Resources/*.png）
+pikmin_render_out/
+idle/
+carry/
+peek_idle/
+peek_wave/
+for blender/
+picnic-basket-low-poly/
