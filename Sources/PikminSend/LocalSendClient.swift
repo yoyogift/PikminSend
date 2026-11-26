@@ -82,8 +82,8 @@ final class LocalSendClient: @unchecked Sendable {
         self.session = URLSession(configuration: transferConfig, delegate: delegate, delegateQueue: nil)
 
         let probeConfig = URLSessionConfiguration.ephemeral
-        probeConfig.timeoutIntervalForRequest = 2.5
-        probeConfig.timeoutIntervalForResource = 3.5
+        probeConfig.timeoutIntervalForRequest = 3.5
+        probeConfig.timeoutIntervalForResource = 4.5
         self.probeSession = URLSession(configuration: probeConfig, delegate: delegate, delegateQueue: nil)
     }
 

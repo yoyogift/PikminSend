@@ -14,7 +14,7 @@ final class LocalSendServer: @unchecked Sendable {
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "com.kokoa.PikminSend.server")
 
-    private(set) var boundPort: Int = 53317
+    private(set) var boundPort: Int = 53318
 
     var onPeerSeen: ((LocalSendInfo, String) -> Void)?
     var onIncomingOffer: ((IncomingTransferOffer, @escaping @Sendable (Bool) -> Void) -> Void)?
@@ -32,7 +32,8 @@ final class LocalSendServer: @unchecked Sendable {
     private var pendingDecisions: [String: (Bool) -> Void] = [:]
 
     func start() {
-        startListener(on: 53317, allowFallback: true)
+        // 避開官方 LocalSend 預設的 53317 埠，讓兩者可同時在同台 Mac 共存
+        startListener(on: 53318, allowFallback: true)
     }
 
     func stop() {
@@ -54,9 +55,9 @@ final class LocalSendServer: @unchecked Sendable {
                 case .ready:
                     self.boundPort = Int(portValue)
                 case .failed:
-                    if allowFallback && portValue == 53317 {
+                    if allowFallback && portValue == 53318 {
                         newListener.cancel()
-                        self.startListener(on: 53318, allowFallback: false)
+                        self.startListener(on: 53319, allowFallback: false)
                     }
                 default:
                     break
@@ -70,8 +71,8 @@ final class LocalSendServer: @unchecked Sendable {
             newListener.start(queue: queue)
             listener = newListener
         } catch {
-            if allowFallback && portValue == 53317 {
-                startListener(on: 53318, allowFallback: false)
+            if allowFallback && portValue == 53318 {
+                startListener(on: 53319, allowFallback: false)
             }
         }
     }

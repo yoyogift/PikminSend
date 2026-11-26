@@ -12,7 +12,7 @@ final class DiscoveryManager: ObservableObject {
     private var socketFD: Int32 = -1
     private var readSource: DispatchSourceRead?
     private let socketQueue = DispatchQueue(label: "com.kokoa.PikminSend.multicast")
-    private var localPort: Int = 53317
+    private var localPort: Int = 53318
 
     func start(localPort: Int) {
         self.localPort = localPort
@@ -36,14 +36,17 @@ final class DiscoveryManager: ObservableObject {
     }
 
     func registerOrUpdatePeer(info: LocalSendInfo, ip: String, isTailscale: Bool? = nil) {
+        let cleanIP = ip.components(separatedBy: "%").first ?? ip
         guard info.fingerprint != LocalIdentity.fingerprint else { return }
-        let tailscale = isTailscale ?? ip.hasPrefix("100.")
+        guard !Self.localIPAddresses().contains(cleanIP) else { return }
+
+        let tailscale = isTailscale ?? cleanIP.hasPrefix("100.")
         let peer = LocalSendPeer(
             alias: info.alias,
             deviceModel: info.deviceModel,
             deviceType: info.deviceType,
             fingerprint: info.fingerprint,
-            ip: ip,
+            ip: cleanIP,
             port: info.port,
             protocolScheme: info.protocolScheme,
             isTailscale: tailscale,
@@ -55,7 +58,9 @@ final class DiscoveryManager: ObservableObject {
     func refreshAll() async {
         isScanning = true
         sendMulticastAnnouncement()
-        await scanTailscalePeers()
+        async let lanTask: Void = scanLANPeersFromARP()
+        async let tsTask: Void = scanTailscalePeers()
+        _ = await (lanTask, tsTask)
         pruneStalePeers()
         isScanning = false
     }
@@ -77,6 +82,36 @@ final class DiscoveryManager: ObservableObject {
     private func pruneStalePeers() {
         let cutoff = Date().addingTimeInterval(-120)
         peers.removeAll { $0.lastSeen < cutoff }
+    }
+
+    // MARK: - 本機 IP 過濾（避免列到同台 Mac 上的官方 LocalSend）
+
+    private static func localIPAddresses() -> Set<String> {
+        var result: Set<String> = ["127.0.0.1", "::1"]
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else {
+            return result
+        }
+        defer { freeifaddrs(ifaddr) }
+
+        var ptr: UnsafeMutablePointer<ifaddrs>? = firstAddr
+        while let current = ptr {
+            if let addr = current.pointee.ifa_addr {
+                let family = Int32(addr.pointee.sa_family)
+                if family == AF_INET || family == AF_INET6 {
+                    var hostBuffer = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    let addrLen = socklen_t(family == AF_INET ? MemoryLayout<sockaddr_in>.size : MemoryLayout<sockaddr_in6>.size)
+                    if getnameinfo(addr, addrLen, &hostBuffer, socklen_t(hostBuffer.count), nil, 0, NI_NUMERICHOST) == 0 {
+                        let ipStr = String(cString: hostBuffer).components(separatedBy: "%").first ?? ""
+                        if !ipStr.isEmpty {
+                            result.insert(ipStr)
+                        }
+                    }
+                }
+            }
+            ptr = current.pointee.ifa_next
+        }
+        return result
     }
 
     // MARK: - UDP Multicast (LAN)
@@ -101,6 +136,7 @@ final class DiscoveryManager: ObservableObject {
             }
         }
         guard bindResult == 0 else {
+            PikminLog.write("multicast bind(53317) failed: errno=\(errno)")
             close(fd)
             return
         }
@@ -110,8 +146,8 @@ final class DiscoveryManager: ObservableObject {
         mreq.imr_interface = in_addr(s_addr: INADDR_ANY.bigEndian)
         setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, socklen_t(MemoryLayout<ip_mreq>.size))
 
-        var nonBlock = fcntl(fd, F_GETFL, 0)
-        fcntl(fd, F_SETFL, nonBlock | O_NONBLOCK)
+        let nonBlock = fcntl(fd, F_GETFL, 0)
+        _ = fcntl(fd, F_SETFL, nonBlock | O_NONBLOCK)
 
         socketFD = fd
 
@@ -211,65 +247,14 @@ final class DiscoveryManager: ObservableObject {
         }
     }
 
-    // MARK: - Tailscale Peer Discovery
+    // MARK: - 主動區網 ARP 掃描（避免官方版佔用 UDP 53317 時漏掉設備）
 
-    private func scanTailscalePeers() async {
-        let candidates = await fetchOnlineTailscaleIPs()
-        guard !candidates.isEmpty else { return }
-
-        let myPort = localPort
-        await withTaskGroup(of: LocalSendPeer?.self) { group in
-            for candidate in candidates {
-                group.addTask {
-                    for scheme in ["http", "https"] {
-                        for port in [53317, 53318] {
-                            if let resp = await LocalSendClient.shared.register(
-                                ip: candidate.ip,
-                                port: port,
-                                scheme: scheme,
-                                localPort: myPort
-                            ) {
-                                return LocalSendPeer(
-                                    alias: resp.alias.isEmpty ? candidate.hostName : resp.alias,
-                                    deviceModel: resp.deviceModel,
-                                    deviceType: resp.deviceType,
-                                    fingerprint: resp.fingerprint ?? candidate.ip,
-                                    ip: candidate.ip,
-                                    port: port,
-                                    protocolScheme: scheme,
-                                    isTailscale: true,
-                                    lastSeen: Date()
-                                )
-                            }
-                        }
-                    }
-                    return nil
-                }
-            }
-
-            for await peer in group {
-                if let peer {
-                    upsertPeer(peer)
-                }
-            }
-        }
-    }
-
-    private func fetchOnlineTailscaleIPs() async -> [(hostName: String, ip: String)] {
-        await Task.detached(priority: .utility) {
-            let cliPaths = [
-                "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
-                "/opt/homebrew/bin/tailscale",
-                "/usr/local/bin/tailscale"
-            ]
-
-            guard let cliPath = cliPaths.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
-                return []
-            }
-
+    private func scanLANPeersFromARP() async {
+        let selfIPs = Self.localIPAddresses()
+        let arpIPs = await Task.detached(priority: .utility) { () -> [String] in
             let process = Process()
-            process.executableURL = URL(fileURLWithPath: cliPath)
-            process.arguments = ["status", "--json"]
+            process.executableURL = URL(fileURLWithPath: "/usr/sbin/arp")
+            process.arguments = ["-an"]
             let pipe = Pipe()
             process.standardOutput = pipe
             process.standardError = Pipe()
@@ -278,7 +263,150 @@ final class DiscoveryManager: ObservableObject {
                 try process.run()
                 let data = pipe.fileHandleForReading.readDataToEndOfFile()
                 process.waitUntilExit()
-                guard process.terminationStatus == 0 else { return [] }
+                let output = String(data: data, encoding: .utf8) ?? ""
+                var ips: [String] = []
+                for line in output.components(separatedBy: .newlines) {
+                    guard let start = line.firstIndex(of: "("),
+                          let end = line.firstIndex(of: ")"),
+                          start < end else { continue }
+                    let ip = String(line[line.index(after: start)..<end])
+                    if ip.hasPrefix("169.254.") || ip.hasPrefix("224.") || ip.hasPrefix("239.") || ip.hasSuffix(".255") || ip.hasPrefix("100.") {
+                        continue
+                    }
+                    if !selfIPs.contains(ip) {
+                        ips.append(ip)
+                    }
+                }
+                return Array(Set(ips))
+            } catch {
+                return []
+            }
+        }.value
+
+        guard !arpIPs.isEmpty else { return }
+        let myPort = localPort
+
+        await withTaskGroup(of: LocalSendPeer?.self) { group in
+            for ip in arpIPs {
+                group.addTask {
+                    await Self.probePeer(ip: ip, fallbackName: ip, isTailscale: false, myPort: myPort)
+                }
+            }
+            for await peer in group {
+                if let peer {
+                    upsertPeer(peer)
+                }
+            }
+        }
+    }
+
+    // MARK: - Tailscale Peer Discovery
+
+    private func scanTailscalePeers() async {
+        let candidates = await fetchOnlineTailscaleIPs()
+        PikminLog.write("Tailscale online candidates: \(candidates.map { "\($0.hostName)(\($0.ip))" }.joined(separator: ", "))")
+        guard !candidates.isEmpty else { return }
+
+        let myPort = localPort
+        await withTaskGroup(of: LocalSendPeer?.self) { group in
+            for candidate in candidates {
+                group.addTask {
+                    await Self.probePeer(
+                        ip: candidate.ip,
+                        fallbackName: candidate.hostName,
+                        isTailscale: true,
+                        myPort: myPort
+                    )
+                }
+            }
+
+            for await peer in group {
+                if let peer {
+                    PikminLog.write("Tailscale peer found: \(peer.alias) @ \(peer.protocolScheme)://\(peer.ip):\(peer.port)")
+                    upsertPeer(peer)
+                }
+            }
+        }
+    }
+
+    private static func probePeer(ip: String, fallbackName: String, isTailscale: Bool, myPort: Int) async -> LocalSendPeer? {
+        let targets: [(scheme: String, port: Int)] = [
+            ("https", 53317),
+            ("http", 53317),
+            ("https", 53318),
+            ("http", 53318)
+        ]
+
+        return await withTaskGroup(of: LocalSendPeer?.self) { group in
+            for target in targets {
+                group.addTask {
+                    if let resp = await LocalSendClient.shared.register(
+                        ip: ip,
+                        port: target.port,
+                        scheme: target.scheme,
+                        localPort: myPort
+                    ) {
+                        if resp.fingerprint == LocalIdentity.fingerprint {
+                            return nil
+                        }
+                        return LocalSendPeer(
+                            alias: resp.alias.isEmpty ? fallbackName : resp.alias,
+                            deviceModel: resp.deviceModel,
+                            deviceType: resp.deviceType,
+                            fingerprint: resp.fingerprint ?? ip,
+                            ip: ip,
+                            port: target.port,
+                            protocolScheme: target.scheme,
+                            isTailscale: isTailscale,
+                            lastSeen: Date()
+                        )
+                    }
+                    return nil
+                }
+            }
+
+            for await result in group {
+                if let peer = result {
+                    group.cancelAll()
+                    return peer
+                }
+            }
+            return nil
+        }
+    }
+
+    private func fetchOnlineTailscaleIPs() async -> [(hostName: String, ip: String)] {
+        await Task.detached(priority: .utility) {
+            let cliPaths = [
+                "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+                "/opt/homebrew/bin/tailscale",
+                "/usr/local/bin/tailscale",
+                "/usr/bin/tailscale"
+            ]
+
+            guard let cliPath = cliPaths.first(where: { FileManager.default.isExecutableFile(atPath: $0) }) else {
+                PikminLog.write("Tailscale CLI not found")
+                return []
+            }
+
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: cliPath)
+            process.arguments = ["status", "--json"]
+            let pipe = Pipe()
+            let errPipe = Pipe()
+            process.standardOutput = pipe
+            process.standardError = errPipe
+
+            do {
+                try process.run()
+                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                guard process.terminationStatus == 0 else {
+                    let errStr = String(data: errData, encoding: .utf8) ?? ""
+                    PikminLog.write("tailscale status failed (\(process.terminationStatus)): \(errStr)")
+                    return []
+                }
 
                 guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                       let peerMap = json["Peer"] as? [String: [String: Any]] else {
@@ -297,6 +425,7 @@ final class DiscoveryManager: ObservableObject {
                 }
                 return result
             } catch {
+                PikminLog.write("tailscale status error: \(error.localizedDescription)")
                 return []
             }
         }.value
