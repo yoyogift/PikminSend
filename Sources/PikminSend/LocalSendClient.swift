@@ -16,20 +16,51 @@ final class InsecureTrustDelegate: NSObject, URLSessionDelegate, @unchecked Send
     }
 }
 
+enum PikminLog {
+    private static let logURL = URL(fileURLWithPath: "/tmp/pikminsend.log")
+    private static let queue = DispatchQueue(label: "com.kokoa.PikminSend.log")
+
+    static func write(_ message: String) {
+        let ts = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(ts)] \(message)\n"
+        queue.async {
+            if let data = line.data(using: .utf8) {
+                if FileManager.default.fileExists(atPath: logURL.path),
+                   let handle = try? FileHandle(forWritingTo: logURL) {
+                    defer { try? handle.close() }
+                    _ = try? handle.seekToEnd()
+                    try? handle.write(contentsOf: data)
+                } else {
+                    try? data.write(to: logURL)
+                }
+            }
+        }
+    }
+}
+
 enum LocalSendTransferError: LocalizedError {
     case emptyPayload
+    case folderNotSupported
+    case unreachablePeer(String)
     case invalidResponse
-    case rejectedByPeer(Int)
+    case rejectedByPeer(Int, String)
     case missingFileToken
 
     var errorDescription: String? {
         switch self {
         case .emptyPayload:
             return "籃子裡沒有內容"
+        case .folderNotSupported:
+            return "暫不支援直接傳送資料夾，請先壓縮為 zip"
+        case .unreachablePeer(let alias):
+            return "無法連線到 \(alias)，請確認對方已開啟 LocalSend 並在同一網路"
         case .invalidResponse:
-            return "對方回應格式錯誤"
-        case .rejectedByPeer(let code):
-            return "對方拒絕或無法接收 (HTTP \(code))"
+            return "對方回應格式錯誤或網址無效"
+        case .rejectedByPeer(let code, let detail):
+            if detail.isEmpty {
+                return "對方拒絕或無法接收 (HTTP \(code))"
+            }
+            return "對方拒絕或無法接收 (HTTP \(code)): \(detail)"
         case .missingFileToken:
             return "缺少上傳憑證 Token"
         }
@@ -46,18 +77,23 @@ final class LocalSendClient: @unchecked Sendable {
         let delegate = InsecureTrustDelegate()
 
         let transferConfig = URLSessionConfiguration.default
-        transferConfig.timeoutIntervalForRequest = 120
+        transferConfig.timeoutIntervalForRequest = 60
         transferConfig.timeoutIntervalForResource = 3600
         self.session = URLSession(configuration: transferConfig, delegate: delegate, delegateQueue: nil)
 
         let probeConfig = URLSessionConfiguration.ephemeral
-        probeConfig.timeoutIntervalForRequest = 1.8
-        probeConfig.timeoutIntervalForResource = 2.5
+        probeConfig.timeoutIntervalForRequest = 2.5
+        probeConfig.timeoutIntervalForResource = 3.5
         self.probeSession = URLSession(configuration: probeConfig, delegate: delegate, delegateQueue: nil)
     }
 
+    private func formattedHost(_ ip: String) -> String {
+        ip.contains(":") && !ip.hasPrefix("[") ? "[\(ip)]" : ip
+    }
+
     func register(ip: String, port: Int, scheme: String, localPort: Int) async -> RegisterResponse? {
-        guard let url = URL(string: "\(scheme)://\(ip):\(port)/api/localsend/v2/register") else {
+        let host = formattedHost(ip)
+        guard let url = URL(string: "\(scheme)://\(host):\(port)/api/localsend/v2/register") else {
             return nil
         }
 
@@ -85,6 +121,7 @@ final class LocalSendClient: @unchecked Sendable {
             }
             return try JSONDecoder().decode(RegisterResponse.self, from: data)
         } catch {
+            PikminLog.write("register failed (\(url.absoluteString)): \(error.localizedDescription)")
             return nil
         }
     }
@@ -99,6 +136,10 @@ final class LocalSendClient: @unchecked Sendable {
             throw LocalSendTransferError.emptyPayload
 
         case .file(let fileURL):
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: fileURL.path, isDirectory: &isDir), isDir.boolValue {
+                throw LocalSendTransferError.folderNotSupported
+            }
             let data = try Data(contentsOf: fileURL)
             let hash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
             fileData = data
@@ -125,10 +166,20 @@ final class LocalSendClient: @unchecked Sendable {
             )
         }
 
-        let baseURL = "\(peer.protocolScheme)://\(peer.ip):\(peer.port)"
+        // 先快速確認對方目前可連線，避免無回應時乾等過久
+        let reachable = await register(ip: peer.ip, port: peer.port, scheme: peer.protocolScheme, localPort: localPort) != nil
+        if !reachable {
+            PikminLog.write("peer unreachable before prepare-upload: \(peer.protocolScheme)://\(peer.ip):\(peer.port)")
+            throw LocalSendTransferError.unreachablePeer(peer.alias)
+        }
+
+        let baseURL = "\(peer.protocolScheme)://\(formattedHost(peer.ip)):\(peer.port)"
         guard let prepareURL = URL(string: "\(baseURL)/api/localsend/v2/prepare-upload") else {
+            PikminLog.write("invalid prepareURL: \(baseURL)")
             throw LocalSendTransferError.invalidResponse
         }
+
+        PikminLog.write("prepare-upload -> \(prepareURL.absoluteString) (alias=\(peer.alias), file=\(metadata.fileName))")
 
         let prepareReq = PrepareUploadRequest(
             info: LocalIdentity.info(port: localPort),
@@ -138,12 +189,21 @@ final class LocalSendClient: @unchecked Sendable {
         var request = URLRequest(url: prepareURL)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONEncoder().encode(prepareReq)
+        request.httpBody = try? JSONEncoder().encode(prepareReq)
 
-        let (prepareData, prepareResponse) = try await session.data(for: request)
+        let (prepareData, prepareResponse): (Data, URLResponse)
+        do {
+            (prepareData, prepareResponse) = try await session.data(for: request)
+        } catch {
+            PikminLog.write("prepare-upload error: \(error)")
+            throw error
+        }
+
         guard let httpPrepare = prepareResponse as? HTTPURLResponse else {
             throw LocalSendTransferError.invalidResponse
         }
+
+        PikminLog.write("prepare-upload response: HTTP \(httpPrepare.statusCode)")
 
         if httpPrepare.statusCode == 204 {
             // 對方已直接透過 preview 完成文字接收
@@ -151,7 +211,9 @@ final class LocalSendClient: @unchecked Sendable {
         }
 
         guard httpPrepare.statusCode == 200 else {
-            throw LocalSendTransferError.rejectedByPeer(httpPrepare.statusCode)
+            let bodySnippet = String(data: prepareData, encoding: .utf8) ?? ""
+            PikminLog.write("prepare-upload rejected (\(httpPrepare.statusCode)): \(bodySnippet)")
+            throw LocalSendTransferError.rejectedByPeer(httpPrepare.statusCode, bodySnippet)
         }
 
         let prepared = try JSONDecoder().decode(PrepareUploadResponse.self, from: prepareData)
@@ -174,11 +236,14 @@ final class LocalSendClient: @unchecked Sendable {
         uploadRequest.httpMethod = "POST"
         uploadRequest.setValue("application/octet-stream", forHTTPHeaderField: "Content-Type")
 
-        let (_, uploadResponse) = try await session.upload(for: uploadRequest, from: fileData)
+        let (uploadData, uploadResponse) = try await session.upload(for: uploadRequest, from: fileData)
         guard let httpUpload = uploadResponse as? HTTPURLResponse, (200..<300).contains(httpUpload.statusCode) else {
             let code = (uploadResponse as? HTTPURLResponse)?.statusCode ?? -1
-            throw LocalSendTransferError.rejectedByPeer(code)
+            let bodySnippet = String(data: uploadData, encoding: .utf8) ?? ""
+            PikminLog.write("upload rejected (\(code)): \(bodySnippet)")
+            throw LocalSendTransferError.rejectedByPeer(code, bodySnippet)
         }
+        PikminLog.write("upload completed -> \(peer.alias)")
     }
 
     private func mimeType(for url: URL) -> String {

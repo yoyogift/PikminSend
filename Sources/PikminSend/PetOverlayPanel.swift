@@ -101,7 +101,8 @@ final class PetOverlayViewModel: ObservableObject {
     @Published var draftText = ""
     @Published var isCarryingAway = false
     @Published var isSending = false
-    @Published var statusNote = "雙擊 Shift 召喚・右鍵或拖曳裝籃・點路牌選對象"
+    @Published var isError = false
+    @Published var statusNote = ""
 
     private let localPortProvider: () -> Int
 
@@ -115,9 +116,10 @@ final class PetOverlayViewModel: ObservableObject {
     func resetForAppearance() {
         isCarryingAway = false
         isSending = false
+        isError = false
         showBusStopMenu = false
         showTextComposer = false
-        statusNote = "雙擊 Shift 召喚・右鍵或拖曳裝籃・點路牌選對象"
+        statusNote = ""
     }
 
     func pickFile() {
@@ -127,21 +129,29 @@ final class PetOverlayViewModel: ObservableObject {
         panel.allowsMultipleSelection = false
         panel.prompt = "放進籃子"
         if panel.runModal() == .OK, let url = panel.url {
+            isError = false
+            statusNote = ""
             payload = .file(url)
         }
     }
 
     func loadClipboard() {
         if let str = NSPasteboard.general.string(forType: .string), !str.isEmpty {
+            isError = false
+            statusNote = ""
             payload = .text(str, isClipboard: true)
         } else {
+            isError = true
             statusNote = "剪貼板目前沒有文字內容"
+            NSSound.beep()
         }
     }
 
     func confirmDraftText() {
         let trimmed = draftText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
+            isError = false
+            statusNote = ""
             payload = .text(trimmed, isClipboard: false)
         }
         draftText = ""
@@ -151,13 +161,16 @@ final class PetOverlayViewModel: ObservableObject {
     func sendToPeer(_ peer: LocalSendPeer) {
         guard payload != .empty else {
             showBusStopMenu = false
+            isError = true
             statusNote = "籃子是空的！請先按右鍵或拖曳放入檔案"
+            NSSound.beep()
             return
         }
         guard !isSending else { return }
 
         showBusStopMenu = false
         isSending = true
+        isError = false
         let currentPayload = payload
         let myPort = localPortProvider()
         statusNote = "正在等待 \(peer.alias) 確認接收…"
@@ -165,6 +178,7 @@ final class PetOverlayViewModel: ObservableObject {
         Task {
             do {
                 try await LocalSendClient.shared.send(payload: currentPayload, to: peer, localPort: myPort)
+                isError = false
                 statusNote = "已送達 \(peer.alias)！"
                 withAnimation(.easeIn(duration: 0.7)) {
                     isCarryingAway = true
@@ -172,10 +186,13 @@ final class PetOverlayViewModel: ObservableObject {
                 try? await Task.sleep(nanoseconds: 780_000_000)
                 payload = .empty
                 isSending = false
+                statusNote = ""
                 onDismiss?()
             } catch {
                 isSending = false
-                statusNote = error.localizedDescription
+                isError = true
+                statusNote = "發送失敗：\(error.localizedDescription)"
+                NSSound.beep()
             }
         }
     }
@@ -185,15 +202,27 @@ struct PetOverlayView: View {
     @ObservedObject var viewModel: PetOverlayViewModel
     @ObservedObject var discovery: DiscoveryManager
 
+    private var bubbleText: String? {
+        if viewModel.isSending || !viewModel.statusNote.isEmpty {
+            return viewModel.statusNote
+        }
+        if viewModel.payload != .empty {
+            return viewModel.payload.summary
+        }
+        return nil
+    }
+
     var body: some View {
         ZStack(alignment: .bottom) {
             VStack(spacing: 6) {
                 if viewModel.showTextComposer {
                     HStack(spacing: 6) {
-                        TextField("輸入要傳送的文字…", text: $viewModel.draftText)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 220)
-                            .onSubmit { viewModel.confirmDraftText() }
+                        AutoFocusTextField(
+                            placeholder: "輸入要傳送的文字…",
+                            text: $viewModel.draftText,
+                            onSubmit: { viewModel.confirmDraftText() }
+                        )
+                        .frame(width: 220, height: 24)
                         Button("放入") { viewModel.confirmDraftText() }
                             .buttonStyle(.borderedProminent)
                     }
@@ -201,14 +230,29 @@ struct PetOverlayView: View {
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
                 }
 
-                // 狀態氣泡
-                Text(viewModel.isSending || viewModel.payload == .empty ? viewModel.statusNote : viewModel.payload.summary)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.primary)
+                // 狀態氣泡（待機且無錯誤訊息時不顯示）
+                if let bubbleText {
+                    HStack(spacing: 5) {
+                        if viewModel.isError {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .font(.system(size: 11.5))
+                                .foregroundStyle(.red)
+                        }
+                        Text(bubbleText)
+                            .font(.system(size: 12, weight: .medium))
+                            .foregroundStyle(viewModel.isError ? .red : .primary)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.center)
+                    }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 6)
                     .background(.regularMaterial, in: Capsule())
+                    .overlay(
+                        Capsule()
+                            .stroke(viewModel.isError ? Color.red.opacity(0.6) : Color.clear, lineWidth: 1)
+                    )
                     .shadow(color: .black.opacity(0.15), radius: 6, y: 2)
+                }
 
                 HStack(alignment: .bottom, spacing: 6) {
                     // 真實 3D 算圖皮克敏動畫（支援直接拖曳檔案進籃子）
@@ -287,7 +331,9 @@ struct PetOverlayView: View {
                                             Spacer()
                                         }
                                         .frame(width: 230)
-                                        .padding(.vertical, 4)
+                                        .padding(.vertical, 6)
+                                        .padding(.horizontal, 6)
+                                        .contentShape(Rectangle())
                                     }
                                     .buttonStyle(.plain)
                                 }
@@ -302,6 +348,71 @@ struct PetOverlayView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .padding(.bottom, 8)
+    }
+}
+
+private struct AutoFocusTextField: NSViewRepresentable {
+    let placeholder: String
+    @Binding var text: String
+    let onSubmit: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let field = NSTextField()
+        field.placeholderString = placeholder
+        field.bezelStyle = .roundedBezel
+        field.isBordered = true
+        field.delegate = context.coordinator
+        field.stringValue = text
+
+        DispatchQueue.main.async {
+            if let window = field.window {
+                NSApp.activate(ignoringOtherApps: true)
+                window.makeKeyAndOrderFront(nil)
+                window.makeFirstResponder(field)
+            }
+        }
+        return field
+    }
+
+    func updateNSView(_ nsView: NSTextField, context: Context) {
+        if nsView.stringValue != text {
+            nsView.stringValue = text
+        }
+        if !context.coordinator.didFocus, let window = nsView.window {
+            context.coordinator.didFocus = true
+            DispatchQueue.main.async {
+                NSApp.activate(ignoringOtherApps: true)
+                window.makeKeyAndOrderFront(nil)
+                window.makeFirstResponder(nsView)
+            }
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: AutoFocusTextField
+        var didFocus = false
+
+        init(_ parent: AutoFocusTextField) {
+            self.parent = parent
+        }
+
+        func controlTextDidChange(_ obj: Notification) {
+            if let field = obj.object as? NSTextField {
+                parent.text = field.stringValue
+            }
+        }
+
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                parent.onSubmit()
+                return true
+            }
+            return false
+        }
     }
 }
 

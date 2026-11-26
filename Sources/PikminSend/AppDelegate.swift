@@ -71,11 +71,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "重新掃描區網與 Tailscale", action: #selector(refreshPeers), keyEquivalent: "r"))
         menu.addItem(NSMenuItem(title: "測試左下角探頭接收", action: #selector(triggerTestPeek), keyEquivalent: ""))
         menu.addItem(.separator())
-
-        let axTitle = ShiftDoubleTapMonitor.hasAccessibilityPermission
-            ? "輔助使用權限：已授權"
-            : "授權輔助使用權限 (雙擊 Shift 必備)…"
-        menu.addItem(NSMenuItem(title: axTitle, action: #selector(requestAccessibility), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "設定與教學…", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(title: "結束 PikminSend", action: #selector(quitApp), keyEquivalent: "q"))
 
@@ -90,7 +86,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         shiftMonitor.start()
 
-        if !ShiftDoubleTapMonitor.hasAccessibilityPermission {
+        let promptedKey = "PikminSend.HasPromptedAccessibility"
+        if !ShiftDoubleTapMonitor.hasAccessibilityPermission && !UserDefaults.standard.bool(forKey: promptedKey) {
+            UserDefaults.standard.set(true, forKey: promptedKey)
             ShiftDoubleTapMonitor.promptAccessibilityPermission()
         }
     }
@@ -109,9 +107,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         receiverPeekPanel.showPeek(senderName: "Windows-PC (Tailscale)", itemSummary: "demo_photo.png · 3.2 MB")
     }
 
-    @objc private func requestAccessibility() {
-        ShiftDoubleTapMonitor.promptAccessibilityPermission()
-        setupStatusBar()
+    @objc private func openSettings() {
+        SettingsWindowController.shared.show(discovery: discovery)
     }
 
     @objc private func quitApp() {

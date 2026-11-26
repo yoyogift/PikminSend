@@ -120,8 +120,30 @@ enum LocalIdentity {
         return generated
     }()
 
+    private static let customAliasKey = "PikminSend.CustomAlias"
+
+    static var defaultAlias: String {
+        let host = Host.current().localizedName ?? "Mac"
+        return "\(host) (Pikmin)"
+    }
+
+    static var customAlias: String {
+        get {
+            UserDefaults.standard.string(forKey: customAliasKey) ?? ""
+        }
+        set {
+            let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                UserDefaults.standard.removeObject(forKey: customAliasKey)
+            } else {
+                UserDefaults.standard.set(trimmed, forKey: customAliasKey)
+            }
+        }
+    }
+
     static var alias: String {
-        Host.current().localizedName ?? "Pikmin Mac"
+        let custom = customAlias.trimmingCharacters(in: .whitespacesAndNewlines)
+        return custom.isEmpty ? defaultAlias : custom
     }
 
     static func info(port: Int) -> LocalSendInfo {

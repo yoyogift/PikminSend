@@ -81,7 +81,7 @@ final class LocalSendServer: @unchecked Sendable {
         receiveHTTPRequest(on: connection, buffer: Data())
     }
 
-    private func receiveHTTPRequest(on connection: NWConnection, buffer: Data) {
+    private func receiveHTTPRequest(on connection: NWConnection, buffer: Data, sentContinue: Bool = false) {
         connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { [weak self] chunk, _, isComplete, error in
             guard let self else { return }
             var nextBuffer = buffer
@@ -93,13 +93,35 @@ final class LocalSendServer: @unchecked Sendable {
                 let headerData = nextBuffer.subdata(in: 0..<headerRange.lowerBound)
                 let bodyStart = headerRange.upperBound
                 let headerText = String(data: headerData, encoding: .utf8) ?? ""
-                let contentLength = self.parseContentLength(from: headerText)
+                var didSendContinue = sentContinue
 
-                if nextBuffer.count - bodyStart >= contentLength {
-                    let bodyData = nextBuffer.subdata(in: bodyStart..<(bodyStart + contentLength))
-                    self.dispatchHTTPRequest(headerText: headerText, body: bodyData, connection: connection)
+                if !didSendContinue && self.hasExpect100Continue(headerText) {
+                    didSendContinue = true
+                    connection.send(content: Data("HTTP/1.1 100 Continue\r\n\r\n".utf8), completion: .contentProcessed { _ in })
+                }
+
+                if self.isChunkedTransfer(headerText) {
+                    let rawBody = nextBuffer.subdata(in: bodyStart..<nextBuffer.count)
+                    if let decodedBody = self.decodeChunkedBody(rawBody) {
+                        self.dispatchHTTPRequest(headerText: headerText, body: decodedBody, connection: connection)
+                        return
+                    }
+                } else {
+                    let contentLength = self.parseContentLength(from: headerText)
+                    if nextBuffer.count - bodyStart >= contentLength {
+                        let bodyData = nextBuffer.subdata(in: bodyStart..<(bodyStart + contentLength))
+                        self.dispatchHTTPRequest(headerText: headerText, body: bodyData, connection: connection)
+                        return
+                    }
+                }
+
+                if isComplete || error != nil {
+                    connection.cancel()
                     return
                 }
+
+                self.receiveHTTPRequest(on: connection, buffer: nextBuffer, sentContinue: didSendContinue)
+                return
             }
 
             if isComplete || error != nil {
@@ -107,7 +129,58 @@ final class LocalSendServer: @unchecked Sendable {
                 return
             }
 
-            self.receiveHTTPRequest(on: connection, buffer: nextBuffer)
+            self.receiveHTTPRequest(on: connection, buffer: nextBuffer, sentContinue: sentContinue)
+        }
+    }
+
+    private func hasExpect100Continue(_ headerText: String) -> Bool {
+        for line in headerText.split(separator: "\r\n") {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            if parts.count == 2 && parts[0].trimmingCharacters(in: .whitespaces).lowercased() == "expect" {
+                return parts[1].lowercased().contains("100-continue")
+            }
+        }
+        return false
+    }
+
+    private func isChunkedTransfer(_ headerText: String) -> Bool {
+        for line in headerText.split(separator: "\r\n") {
+            let parts = line.split(separator: ":", maxSplits: 1)
+            if parts.count == 2 && parts[0].trimmingCharacters(in: .whitespaces).lowercased() == "transfer-encoding" {
+                return parts[1].lowercased().contains("chunked")
+            }
+        }
+        return false
+    }
+
+    private func decodeChunkedBody(_ data: Data) -> Data? {
+        var result = Data()
+        var index = data.startIndex
+        let crlf = Data("\r\n".utf8)
+
+        while true {
+            guard let lineEnd = data.range(of: crlf, in: index..<data.endIndex) else {
+                return nil
+            }
+            let sizeLine = String(data: data.subdata(in: index..<lineEnd.lowerBound), encoding: .utf8) ?? ""
+            let hexPart = sizeLine.split(separator: ";", maxSplits: 1).first?.trimmingCharacters(in: .whitespaces) ?? ""
+            guard let chunkSize = Int(hexPart, radix: 16) else {
+                return nil
+            }
+
+            index = lineEnd.upperBound
+            if chunkSize == 0 {
+                if data.distance(from: index, to: data.endIndex) >= 2 {
+                    return result
+                }
+                return nil
+            }
+
+            guard data.distance(from: index, to: data.endIndex) >= chunkSize + 2 else {
+                return nil
+            }
+            result.append(data.subdata(in: index..<(index + chunkSize)))
+            index += chunkSize + 2
         }
     }
 
@@ -285,6 +358,7 @@ final class LocalSendServer: @unchecked Sendable {
         if let expectedHash = meta.sha256, !expectedHash.isEmpty {
             let actualHash = SHA256.hash(data: body).map { String(format: "%02x", $0) }.joined()
             if actualHash.lowercased() != expectedHash.lowercased() {
+                PikminLog.write("422 hash mismatch: expected=\(expectedHash) actual=\(actualHash) bodyBytes=\(body.count)")
                 sendResponse(connection: connection, status: "422 Unprocessable Entity", body: Data())
                 return
             }
@@ -293,7 +367,8 @@ final class LocalSendServer: @unchecked Sendable {
         var savedURL: URL?
         var receivedText: String?
 
-        if meta.fileType == "text/plain", let text = String(data: body, encoding: .utf8) {
+        if (meta.fileType.lowercased().hasPrefix("text/") || meta.preview != nil),
+           let text = String(data: body, encoding: .utf8) ?? meta.preview {
             receivedText = text
         } else {
             savedURL = saveToDownloads(fileName: meta.fileName, data: body)

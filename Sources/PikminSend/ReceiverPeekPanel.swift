@@ -77,9 +77,8 @@ final class ReceiverPeekPanel: NSPanel {
 
     func markCompleted(savedURL: URL?, receivedText: String?) {
         if let receivedText {
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(receivedText, forType: .string)
-            viewModel.statusLine = "已複製文字到剪貼板！"
+            viewModel.statusLine = "已開啟文字內容！"
+            TextMessageWindowController.shared.show(senderName: viewModel.senderName, text: receivedText)
         } else if let savedURL {
             viewModel.statusLine = "已存入下載：\(savedURL.lastPathComponent)"
         } else {
